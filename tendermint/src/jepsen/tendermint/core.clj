@@ -77,7 +77,7 @@
 (defrecord SetClient [node]
   client/Client
 
-  (open [_ test node]
+  (open! [_ test node]
     (SetClient. node))
 
   (invoke! [_ test op]
@@ -284,26 +284,39 @@
 
     :peekaboo-dup-validators {:nemesis (nemesis/partitioner
                                         (peekaboo-dup-validators-grudge test))
-                              :generator (gen/start-stop 0 5)}
+                              :generator (seq [{:type :info, :f :start}
+                                               (gen/sleep 5)
+                                               {:type :info, :f :stop}])}
 
     :split-dup-validators {:nemesis (nemesis/partitioner
                                      (split-dup-validators-grudge test))
                            :generator (gen/once {:type :info, :f :start})}
 
     :half-partitions {:nemesis   (nemesis/partition-random-halves)
-                      :generator (gen/start-stop 5 30)}
+                      :generator (seq [(gen/sleep 5)
+                                       {:type :info, :f :start}
+                                       (gen/sleep 30)
+                                       {:type :info, :f :stop}])}
 
     :ring-partitions {:nemesis (nemesis/partition-majorities-ring)
-                      :generator (gen/start-stop 5 30)}
+                      :generator (seq [(gen/sleep 5)
+                                       {:type :info, :f :start}
+                                       (gen/sleep 30)
+                                       {:type :info, :f :stop}])}
 
     :single-partitions {:nemesis (nemesis/partition-random-node)
-                        :generator (gen/start-stop 5 30)}
+                        :generator (seq [(gen/sleep 5)
+                                       {:type :info, :f :start}
+                                       (gen/sleep 30)
+                                       {:type :info, :f :stop}])}
 
     :clocks     {:nemesis   (nt/clock-nemesis)
                  :generator (gen/stagger 5 (nt/clock-gen))}
 
     :crash      {:nemesis (crash-nemesis)
-                 :generator (gen/start-stop 15 0)}
+                 :generator (seq [(gen/sleep 15)
+                                       {:type :info, :f :start}
+                                       {:type :info, :f :stop}])}
 
     :truncate-merkleeyes {:nemesis (crash-truncate-nemesis
                                     test 1/3 "/jepsen/jepsen.db/000001.log")
