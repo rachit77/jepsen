@@ -380,7 +380,7 @@
                                     {:type :invoke
                                      :f    :add
                                      :value x}))
-                             gen/seq
+                             ; gen.seq
                              (gen/stagger 1/2)))))
          :final-generator (deref-gen
                            (delay
