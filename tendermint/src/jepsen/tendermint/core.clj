@@ -328,8 +328,7 @@
                           :generator (->> {:type :info, :f :crash}
                                           (gen/delay 10))}
 
-    :none       {:nemesis   nemesis/noop
-                 :generator gen/void}))
+    :none       {:nemesis   nemesis/noop}))
 
 (defn deref-gen
   "Sometimes you need to build a generator not *now*, but *later*; e.g. because
@@ -363,7 +362,8 @@
                                         (gen/limit 120))))
                      :final-generator nil
                      :checker {:linear (independent/checker
-                                        (checker/linearizable))}}
+                                         (checker/linearizable {:model (model/cas-register)
+                                                                :algorithm :linear}))}}
       :set
       (let [keys (atom [])]
         {:client (SetClient. nil)
@@ -389,8 +389,8 @@
                                n
                                @keys
                                (fn [k]
-                                 (gen/each (gen/once {:type :invoke
-                                                      :f :read})))))))
+                                 (gen/each-thread (gen/once {:type :invoke
+                                                             :f :read})))))))
          :checker {:set (independent/checker (checker/set))}}))))
 
 (defn test
