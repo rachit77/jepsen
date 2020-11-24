@@ -145,15 +145,13 @@
   (reify db/DB
     (setup! [_ test node]
       (c/su
-       (info node "installing binaries")
        (install-component! "tendermint"  opts)
        (install-component! "merkleeyes"  opts)
 
-       (info node "writing config")
        (write-config!)
 
         ; OK we're ready to compute the initial validator config.
-       (jepsen/synchronize test)
+       (jepsen/synchronize test 240)
        (when (= node (jepsen/primary test))
          (let [validator-config (tv/initial-config test)]
            (info :initial-config (with-out-str (pprint validator-config)))
@@ -169,7 +167,6 @@
          (write-validator! (get (:validators vc)
                                 (get-in vc [:nodes node]))))
 
-       (info node "starting binaries")
        (start-merkleeyes! test node)
        (start-tendermint! test node)
 

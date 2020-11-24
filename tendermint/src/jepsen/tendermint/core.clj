@@ -402,6 +402,7 @@
               {:name (str "tendermint " (name (:workload opts)) " "
                           (name (:nemesis opts)))
                :os   debian/os
+               :pure-generators true
                :nonserializable-keys [:validator-config]
                :validator-config validator-config})
         db        (td/db test)
