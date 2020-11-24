@@ -138,7 +138,6 @@
 
       :merkleeyes-url   Package URLs for Tendermint components
       :tendermint-url
-      :abci-url
 
       :validator-config   An atom which the DB will fill in with the initial
                           validator config."
@@ -146,10 +145,11 @@
   (reify db/DB
     (setup! [_ test node]
       (c/su
+       (info node "installing binaries")
        (install-component! "tendermint"  opts)
-       (install-component! "abci"        opts)
        (install-component! "merkleeyes"  opts)
 
+       (info node "writing config")
        (write-config!)
 
         ; OK we're ready to compute the initial validator config.
@@ -169,6 +169,7 @@
          (write-validator! (get (:validators vc)
                                 (get-in vc [:nodes node]))))
 
+       (info node "starting binaries")
        (start-merkleeyes! test node)
        (start-tendermint! test node)
 
