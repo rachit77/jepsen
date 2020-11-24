@@ -33,6 +33,8 @@
 (defrecord CasRegisterClient [node]
   client/Client
 
+  (setup! [this test])
+
   (open! [_ test node]
     (CasRegisterClient. node))
 
@@ -72,10 +74,15 @@
         (catch java.net.SocketTimeoutException e
           (assoc op :type crash, :error :timeout)))))
 
-  (teardown! [_ test]))
+  (teardown! [_ test])
+
+  (close! [_ test])
+)
 
 (defrecord SetClient [node]
   client/Client
+
+  (setup! [this test])
 
   (open! [_ test node]
     (SetClient. node))
@@ -127,6 +134,8 @@
           (assoc op :type crash, :error :timeout)))))
 
   (teardown! [_ test])
+
+  (close! [_ test])
 )
 
 (defn peekaboo-dup-validators-grudge
@@ -353,7 +362,7 @@
       :cas-register {:client    (CasRegisterClient. nil)
                      :model     (model/cas-register)
                      :generator (independent/concurrent-generator
-                                 (* 2 n)
+                                 n
                                  (range)
                                  (fn [k]
                                    (->> (gen/mix [w cas])
