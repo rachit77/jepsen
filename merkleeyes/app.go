@@ -1,28 +1,25 @@
-package app
+package merkleeyes
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 
-	"github.com/cosmos/iavl"
-	gogotypes "github.com/gogo/protobuf/types"
-	dbm "github.com/tendermint/tm-db"
-
-	"github.com/tendermint/tendermint/abci/example/code"
 	abci "github.com/tendermint/tendermint/abci/types"
-	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	cryptoenc "github.com/tendermint/tendermint/crypto/encoding"
-	"github.com/tendermint/tendermint/libs/protoio"
+	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/version"
+	dbm "github.com/tendermint/tm-db"
 )
 
-// Transaction type bytes
 const (
+	// Version is the semantic version of this package.
+	Version = "0.1.0"
+
+	// Transaction type bytes
 	TxTypeSet           byte = 0x01
 	TxTypeRm            byte = 0x02
 	TxTypeGet           byte = 0x03
@@ -33,7 +30,7 @@ const (
 
 	NonceLength = 12
 
-	// Additional codes.
+	// Additional error codes.
 	CodeTypeUnknownRequest        = 2
 	CodeTypeEncodingError         = 3
 	CodeTypeBadNonce              = 4
@@ -43,253 +40,131 @@ const (
 	CodeTypeErrUnauthorized       = 8
 )
 
-// Database key for merkle tree save value db values
-var eyesStateKey = []byte("merkleeyes:state")
-
-// MerkleEyesApp is a Merkle KV-store served as an ABCI app.
-type MerkleEyesApp struct {
+// App is a Merkle KV-store served as an ABCI app.
+type App struct {
 	abci.BaseApplication
 
-	state State
-	db    dbm.DB
-
-	height     int64
-	validators *ValidatorSetState
-
+	db      dbm.DB
+	state   *State
 	changes []abci.ValidatorUpdate
+	logger  log.Logger
 }
 
-var _ abci.Application = (*MerkleEyesApp)(nil)
+var _ abci.Application = (*App)(nil)
 
-// MerkleEyesState contains the latest Merkle root hash.
-type MerkleEyesState struct {
-	Hash       []byte             `json:"hash"`
-	Height     int64              `json:"height"`
-	Validators *ValidatorSetState `json:"validators"`
-}
+// New initializes the database, loads any existing state, and returns a new
+// App.
+func New(dbDir string, treeCacheSize int) (*App, error) {
+	const dbName = "merkleeyes"
 
-// ValidatorSetState contains the validator set and its version (~ the number
-// of times it was changed).
-type ValidatorSetState struct {
-	Version    uint64       `json:"version"`
-	Validators []*Validator `json:"validators"`
-}
-
-// Validator represents a single validator.
-type Validator struct {
-	PubKey crypto.PubKey `json:"pub_key"`
-	Power  int64         `json:"power"`
-}
-
-// Has returns true if v is present in the validator set.
-func (vss *ValidatorSetState) Has(v *Validator) bool {
-	for _, v1 := range vss.Validators {
-		if v1.PubKey.Equals(v.PubKey) {
-			return true
-		}
-	}
-	return false
-}
-
-// Remove removes v from the validator set.
-func (vss *ValidatorSetState) Remove(v *Validator) {
-	vals := make([]*Validator, 0, len(vss.Validators)-1)
-	for _, v1 := range vss.Validators {
-		if v1.PubKey.Equals(v.PubKey) {
-			vals = append(vals, v1)
-		}
-	}
-	vss.Validators = vals
-}
-
-// Set updates v.
-func (vss *ValidatorSetState) Set(v *Validator) {
-	for i, v1 := range vss.Validators {
-		if v1.PubKey.Equals(v.PubKey) {
-			vss.Validators[i] = v
-			return
-		}
-	}
-	vss.Validators = append(vss.Validators, v)
-}
-
-// NewMerkleEyesApp initializes the database, loads any existing state, and
-// returns a new MerkleEyesApp.
-func NewMerkleEyesApp(dbName string, cacheSize int) *MerkleEyesApp {
-	// start at 1 so the height returned by query is for the next block, ie. the
-	// one that includes the AppHash for our current state
-	initialHeight := int64(1)
-
-	// Non-persistent case
-	if dbName == "" {
-		tree, err := iavl.NewMutableTree(dbm.NewMemDB(), cacheSize)
-		if err != nil {
-			panic(err)
-		}
-
-		return &MerkleEyesApp{
-			state:  NewState(tree, 0),
-			db:     nil,
-			height: initialHeight,
-		}
-	}
-
-	// Setup the persistent merkle tree
-	var empty bool
-	_, err := os.Stat(filepath.Join(dbName, dbName+".db"))
-	if err != nil && os.IsNotExist(err) {
-		empty = true
-	}
-
-	// Open the db, if the db doesn't exist it will be created
-	db, err := dbm.NewGoLevelDB(dbName, dbName)
+	// Initialize a db.
+	db, err := dbm.NewGoLevelDB(dbName, dbDir)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("create db: %w", err)
 	}
 
-	// Load Tree
-	tree, err := iavl.NewMutableTree(db, cacheSize)
+	// Initialize a state.
+	state, err := NewState(db, treeCacheSize)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("create state: %w", err)
 	}
 
-	if empty {
-		fmt.Println("no existing db, creating new db")
-		bz, err := json.Marshal(MerkleEyesState{
-			Hash:   tree.Hash(),
-			Height: initialHeight,
-		})
-		if err != nil {
-			panic(err)
-		}
-		db.Set(eyesStateKey, bz)
-	} else {
-		fmt.Println("loading existing db")
-	}
-
-	// Load merkle state
-	eyesStateBytes, err := db.Get(eyesStateKey)
-	if err != nil {
-		panic(err)
-	}
-	var eyesState MerkleEyesState
-	err = json.Unmarshal(eyesStateBytes, &eyesState)
-	if err != nil {
-		fmt.Println("error reading MerkleEyesState")
-		panic(err)
-	}
-
-	version, err := tree.Load()
-	if err != nil {
-		panic(err)
-	}
-
-	return &MerkleEyesApp{
-		state:      NewState(tree, version),
-		db:         db,
-		height:     eyesState.Height,
-		validators: new(ValidatorSetState),
-	}
+	return &App{
+		state:   state,
+		db:      db,
+		changes: make([]abci.ValidatorUpdate, 0),
+		logger:  log.NewNopLogger(),
+	}, nil
 }
 
-// CloseDB closes the database
-func (app *MerkleEyesApp) CloseDB() {
-	if app.db != nil {
-		app.db.Close()
-	}
+// SetLogger sets a logger.
+func (app *App) SetLogger(l log.Logger) {
+	app.logger = l
+}
+
+// CloseDB closes the database.
+func (app *App) CloseDB() {
+	app.db.Close()
+}
+
+// ValidatorSetState returns the current ValidatorSetState.
+func (app *App) ValidatorSetState() *ValidatorSetState {
+	return app.state.Validators
 }
 
 // Info implements ABCI.
-func (app *MerkleEyesApp) Info(req abci.RequestInfo) abci.ResponseInfo {
+func (app *App) Info(req abci.RequestInfo) abci.ResponseInfo {
 	return abci.ResponseInfo{
 		Version:          version.ABCIVersion,
 		AppVersion:       1,
-		LastBlockHeight:  app.height,
-		LastBlockAppHash: app.state.Committed().Hash(),
+		LastBlockHeight:  app.state.Height,
+		LastBlockAppHash: app.state.Hash(),
 	}
 }
 
 // InitChain implements ABCI.
-func (app *MerkleEyesApp) InitChain(req abci.RequestInitChain) abci.ResponseInitChain {
+func (app *App) InitChain(req abci.RequestInitChain) abci.ResponseInitChain {
 	for _, v := range req.Validators {
-		app.validators.Set(&Validator{PubKey: ed25519.PubKey(v.PubKey.GetEd25519()), Power: v.Power})
+		app.state.Validators.Set(&Validator{PubKey: ed25519.PubKey(v.PubKey.GetEd25519()), Power: v.Power})
 	}
 
 	return abci.ResponseInitChain{
-		AppHash: app.state.Committed().Hash(),
+		AppHash: app.state.Hash(),
 	}
 }
 
 // CheckTx implements ABCI.
-func (app *MerkleEyesApp) CheckTx(_ abci.RequestCheckTx) abci.ResponseCheckTx {
-	return abci.ResponseCheckTx{Code: code.CodeTypeOK}
+func (app *App) CheckTx(req abci.RequestCheckTx) abci.ResponseCheckTx {
+	if len(req.Tx) < minTxLen() {
+		return abci.ResponseCheckTx{
+			Code: CodeTypeEncodingError,
+			Log:  fmt.Sprintf("Tx length must be at least %d", minTxLen()),
+		}
+	}
+
+	return abci.ResponseCheckTx{Code: abci.CodeTypeOK}
 }
 
 // DeliverTx implements ABCI.
-func (app *MerkleEyesApp) DeliverTx(req abci.RequestDeliverTx) abci.ResponseDeliverTx {
-	tree := app.state.Working()
-	r := app.doTx(tree, req.Tx)
-	if r.IsErr() {
-		fmt.Println("DeliverTx Err", r)
-	}
-	return r
+func (app *App) DeliverTx(req abci.RequestDeliverTx) abci.ResponseDeliverTx {
+	return app.doTx(req.Tx)
 }
 
 // BeginBlock implements ABCI.
-func (app *MerkleEyesApp) BeginBlock(req abci.RequestBeginBlock) abci.ResponseBeginBlock {
+func (app *App) BeginBlock(req abci.RequestBeginBlock) abci.ResponseBeginBlock {
 	// reset valset changes
 	app.changes = make([]abci.ValidatorUpdate, 0)
 	return abci.ResponseBeginBlock{}
 }
 
 // EndBlock implements ABCI.
-func (app *MerkleEyesApp) EndBlock(req abci.RequestEndBlock) abci.ResponseEndBlock {
+func (app *App) EndBlock(req abci.RequestEndBlock) abci.ResponseEndBlock {
 	if len(app.changes) > 0 {
-		app.validators.Version++
+		app.state.Validators.Version++
 	}
 	return abci.ResponseEndBlock{ValidatorUpdates: app.changes}
 }
 
 // Commit implements abci.Application
-func (app *MerkleEyesApp) Commit() abci.ResponseCommit {
-	hash := app.state.Commit()
-
-	app.height++
-
-	if app.db != nil {
-		bz, err := json.Marshal(MerkleEyesState{
-			Hash:       hash,
-			Height:     app.height,
-			Validators: app.validators,
-		})
-		if err != nil {
-			panic(err)
-		}
-		app.db.Set(eyesStateKey, bz)
+func (app *App) Commit() abci.ResponseCommit {
+	err := app.state.Commit(app.db)
+	if err != nil {
+		panic(err)
 	}
-
-	// if app.state.Committed().Size() == 0 {
-	// 	return abci.ResponseCommit{Data: nil}
-	// }
-	return abci.ResponseCommit{Data: hash}
+	return abci.ResponseCommit{Data: app.state.Hash()}
 }
 
 // Query implements ABCI.
-func (app *MerkleEyesApp) Query(req abci.RequestQuery) (res abci.ResponseQuery) {
-	if len(req.Data) == 0 {
-		return
-	}
-	tree := app.state.Committed()
+func (app *App) Query(req abci.RequestQuery) (res abci.ResponseQuery) {
+	tree := app.state.Committed
 
 	if req.Height != 0 {
-		// TODO: support older commits
 		res.Code = CodeTypeInternalError
 		res.Log = "merkleeyes only supports queries on latest commit"
 		return
 	}
 
-	// set the query response height
-	res.Height = app.height
+	res.Height = app.state.Height
 
 	switch req.Path {
 
@@ -297,16 +172,15 @@ func (app *MerkleEyesApp) Query(req abci.RequestQuery) (res abci.ResponseQuery) 
 		key := req.Data // Data holds the key bytes
 		res.Key = key
 		if req.Prove {
-			value, _, err := tree.GetWithProof(storeKey(key))
-			if err != nil {
-				res.Log = "Key not found"
-			}
-			res.Value = value
-			// FIXME: construct proof op and return it
-			// res.Proof = proof
-			// TODO: return index too?
+			res.Code = CodeTypeInternalError
+			res.Log = "Query with proof is not supported"
 		} else {
 			index, value := tree.Get(storeKey(key))
+			if value == nil {
+				res.Code = CodeTypeErrBaseUnknownAddress
+				res.Log = "not found"
+				return
+			}
 			res.Value = value
 			res.Index = int64(index)
 		}
@@ -320,6 +194,11 @@ func (app *MerkleEyesApp) Query(req abci.RequestQuery) (res abci.ResponseQuery) 
 		}
 
 		key, value := tree.GetByIndex(index)
+		if value == nil {
+			res.Code = CodeTypeErrBaseUnknownAddress
+			res.Log = "not found"
+			return
+		}
 		res.Key = key
 		res.Index = int64(index)
 		res.Value = value
@@ -345,93 +224,121 @@ func storeKey(key []byte) []byte {
 	return append([]byte("/key/"), key...)
 }
 
-func (app *MerkleEyesApp) doTx(tree *iavl.MutableTree, tx []byte) abci.ResponseDeliverTx {
-	// minimum length is 12 (nonce) + 1 (type byte) = 13
-	minTxLen := NonceLength + 1
-	if len(tx) < minTxLen {
-		return abci.ResponseDeliverTx{Code: CodeTypeEncodingError, Log: fmt.Sprintf("Tx length must be at least %d", minTxLen)}
+func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
+	if len(tx) < minTxLen() {
+		return abci.ResponseDeliverTx{
+			Code: CodeTypeEncodingError,
+			Log:  fmt.Sprintf("Tx length must be at least %d", minTxLen()),
+		}
 	}
 
-	nonce := tx[:12]
-	tx = tx[12:]
+	var (
+		tree  = app.state.Working
+		nonce = tx[:NonceLength]
+	)
+	tx = tx[NonceLength:]
 
-	// check nonce
+	// 1) Check nonce
 	_, n := tree.Get(nonceKey(nonce))
-	if n == nil {
-		return abci.ResponseDeliverTx{Code: CodeTypeBadNonce, Log: fmt.Sprintf("Nonce %X already exists", nonce)}
+	if n != nil {
+		return abci.ResponseDeliverTx{
+			Code: CodeTypeBadNonce,
+			Log:  fmt.Sprintf("Nonce %X already exists", nonce),
+		}
 	}
-
-	// set nonce
-	tree.Set(nonceKey(nonce), []byte("found"))
+	// mark nonce as processed
+	_ = tree.Set(nonceKey(nonce), []byte{0x01})
 
 	typeByte := tx[0]
 	tx = tx[1:]
+
+	// 2) Execute tx based on type
 	switch typeByte {
-	case TxTypeSet: // Set
+	case TxTypeSet:
 		key, errResp := unmarshalBytes(tx, "key", false)
 		if key == nil {
 			return errResp
 		}
 
-		value, errResp := unmarshalBytes(tx[len(key):], "value", true)
+		value, errResp := unmarshalBytes(tx[prefixedLen(key):], "value", true)
 		if value == nil {
 			return errResp
 		}
 
-		tree.Set(storeKey(key), value)
+		_ = tree.Set(storeKey(key), value)
 
-		fmt.Println("SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
-	case TxTypeRm: // Remove
+		app.logger.Info("SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+
+	case TxTypeRm:
 		key, errResp := unmarshalBytes(tx, "key", true)
 		if key == nil {
 			return errResp
 		}
 
-		tree.Remove(storeKey(key))
-		fmt.Println("RM", fmt.Sprintf("%X", key))
-	case TxTypeGet: // Get
+		_, removed := tree.Remove(storeKey(key))
+		if !removed {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrBaseUnknownAddress,
+				Log:  fmt.Sprintf("Failed to remove %X", key),
+			}
+		}
+
+		app.logger.Info("RM", fmt.Sprintf("%X", key))
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+
+	case TxTypeGet:
 		key, errResp := unmarshalBytes(tx, "key", true)
 		if key == nil {
 			return errResp
 		}
 
 		_, value := tree.Get(storeKey(key))
-		if value != nil {
-			fmt.Println("GET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
-			return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: value}
+		if value == nil {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrBaseUnknownAddress,
+				Log:  fmt.Sprintf("Cannot find key: %X", key)}
 		}
 
-		return abci.ResponseDeliverTx{Code: CodeTypeErrBaseUnknownAddress,
-			Log: fmt.Sprintf("Cannot find key: %X", key)}
-	case TxTypeCompareAndSet: // Compare and Set
+		app.logger.Info("GET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: value}
+
+	case TxTypeCompareAndSet:
 		key, errResp := unmarshalBytes(tx, "key", false)
 		if key == nil {
 			return errResp
 		}
 
-		compareValue, errResp := unmarshalBytes(tx[len(key):], "compareKey", false)
+		compareValue, errResp := unmarshalBytes(tx[prefixedLen(key):], "compareKey", false)
 		if compareValue == nil {
 			return errResp
 		}
 
-		setValue, errResp := unmarshalBytes(tx[len(key)+len(compareValue):], "setValue", true)
+		setValue, errResp := unmarshalBytes(tx[prefixedLen(key)+prefixedLen(compareValue):], "setValue", true)
 		if setValue == nil {
 			return errResp
 		}
 
 		_, value := tree.Get(storeKey(key))
 		if value == nil {
-			return abci.ResponseDeliverTx{Code: CodeTypeErrBaseUnknownAddress,
-				Log: fmt.Sprintf("Cannot find key: %X", key)}
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrBaseUnknownAddress,
+				Log:  fmt.Sprintf("Cannot find key: %X", key),
+			}
 		}
 
 		if !bytes.Equal(value, compareValue) {
-			return abci.ResponseDeliverTx{Code: CodeTypeErrUnauthorized,
-				Log: fmt.Sprintf("Value was %X, not %X", value, compareValue)}
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrUnauthorized,
+				Log:  fmt.Sprintf("Value was %X, not %X", value, compareValue),
+			}
 		}
-		tree.Set(storeKey(key), setValue)
 
-		fmt.Println("CAS-SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", compareValue), fmt.Sprintf("%X", setValue))
+		_ = tree.Set(storeKey(key), setValue)
+
+		app.logger.Info("CAS-SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", compareValue), fmt.Sprintf("%X", setValue))
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+
 	case TxTypeValSetChange:
 		pubKey, errResp := unmarshalBytes(tx, "pubKey", false)
 		if pubKey == nil {
@@ -439,87 +346,97 @@ func (app *MerkleEyesApp) doTx(tree *iavl.MutableTree, tx []byte) abci.ResponseD
 		}
 
 		if len(pubKey) != ed25519.PubKeySize {
-			return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-				Log: fmt.Sprintf("PubKey must be %d bytes: %X is %d bytes", ed25519.PubKeySize, pubKey, len(pubKey))}
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeEncodingError,
+				Log:  fmt.Sprintf("PubKey must be %d bytes: %X is %d bytes", ed25519.PubKeySize, pubKey, len(pubKey)),
+			}
 		}
 
-		tx = tx[ed25519.PubKeySize:]
-		// if len(tx) != 8 {
-		// 	return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-		// 		Log: fmt.Sprintf("Power must be 8 bytes: %X is %d bytes", tx, len(tx))}
-		// }
-
-		power, n := binary.Uvarint(tx)
-		if n != len(tx) {
-			return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-				Log: "Power must be uvarint"}
+		tx = tx[prefixedLen(pubKey):]
+		power, err := decodeInt(tx)
+		if err != nil {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeEncodingError,
+				Log:  fmt.Sprintf("Can't decode power: %v", err),
+			}
 		}
 
 		return app.updateValidator(pubKey, int64(power))
+
 	case TxTypeValSetRead:
-		b, err := json.Marshal(app.validators)
+		bz, err := json.Marshal(app.state.Validators)
 		if err != nil {
-			return abci.ResponseDeliverTx{Code: CodeTypeInternalError,
-				Log: fmt.Sprintf("Error marshalling validator info: %v", err)}
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeInternalError,
+				Log:  fmt.Sprintf("Marshaling error: %v", err),
+			}
 		}
-		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: b, Log: string(b)}
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: bz, Log: string(bz)}
 
 	case TxTypeValSetCAS:
-		version, n := binary.Uvarint(tx)
-		// if n != len(tx) {
-		// 	return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-		// 		Log: "Power must be uvarint"}
-		// }
-		// if len(tx) < 8 {
-		// 	return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-		// 		Log: fmt.Sprintf("Version number must be 8 bytes: remaining tx (%X) is %d bytes", tx, len(tx))}
-		// }
-		if app.validators.Version != version {
-			return abci.ResponseDeliverTx{Code: CodeTypeErrUnauthorized,
-				Log: fmt.Sprintf("Version was %d, not %d", app.validators.Version, version)}
+		if len(tx) < 8 {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeEncodingError,
+				Log:  "Can't decode version: not enough bytes",
+			}
 		}
 
-		tx = tx[n:]
+		version, _ := decodeInt(tx[:8])
+
+		if app.state.Validators.Version != uint64(version) {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrUnauthorized,
+				Log:  fmt.Sprintf("Version was %d, not %d", app.state.Validators.Version, version),
+			}
+		}
+
+		tx = tx[8:]
 
 		pubKey, errResp := unmarshalBytes(tx, "pubKey", false)
 		if pubKey == nil {
 			return errResp
 		}
 		if len(pubKey) != ed25519.PubKeySize {
-			return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-				Log: fmt.Sprintf("PubKey must be %d bytes: %X is %d bytes", ed25519.PubKeySize, pubKey, len(pubKey))}
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeEncodingError,
+				Log:  fmt.Sprintf("PubKey must be %d bytes: %X is %d bytes", ed25519.PubKeySize, pubKey, len(pubKey)),
+			}
 		}
 
-		tx = tx[ed25519.PubKeySize:]
+		tx = tx[prefixedLen(pubKey):]
 
-		power, n := binary.Uvarint(tx)
-		if n != len(tx) {
-			return abci.ResponseDeliverTx{Code: CodeTypeEncodingError,
-				Log: "Power must be uvarint"}
+		power, err := decodeInt(tx)
+		if err != nil {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeEncodingError,
+				Log:  fmt.Sprintf("Can't decode power: %v", err),
+			}
 		}
 
 		return app.updateValidator(pubKey, int64(power))
 
 	default:
-		return abci.ResponseDeliverTx{Code: CodeTypeErrUnknownRequest,
-			Log: fmt.Sprintf("Unexpected Tx type byte %X", typeByte)}
+		return abci.ResponseDeliverTx{
+			Code: CodeTypeErrUnknownRequest,
+			Log:  fmt.Sprintf("Unexpected tx type byte: %X", typeByte),
+		}
 	}
-
-	return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
 }
 
-func (app *MerkleEyesApp) updateValidator(pubKey []byte, power int64) abci.ResponseDeliverTx {
+func (app *App) updateValidator(pubKey []byte, power int64) abci.ResponseDeliverTx {
 	v := &Validator{PubKey: ed25519.PubKey(pubKey), Power: power}
 	if v.Power == 0 {
 		// remove validator
-		if !app.validators.Has(v) {
-			return abci.ResponseDeliverTx{Code: CodeTypeErrUnauthorized,
-				Log: fmt.Sprintf("Cannot remove non-existent validator %v", v)}
+		if !app.state.Validators.Has(v) {
+			return abci.ResponseDeliverTx{
+				Code: CodeTypeErrUnauthorized,
+				Log:  fmt.Sprintf("Cannot remove non-existent validator %v", v),
+			}
 		}
-		app.validators.Remove(v)
+		app.state.Validators.Remove(v)
 	} else {
 		// add or update validator
-		app.validators.Set(v)
+		app.state.Validators.Set(v)
 	}
 
 	var pubKeyEd ed25519.PubKey
@@ -528,23 +445,65 @@ func (app *MerkleEyesApp) updateValidator(pubKey []byte, power int64) abci.Respo
 	if err != nil {
 		panic(err)
 	}
+
+	// remove a previous change (if such exists)
+	for i, c := range app.changes {
+		if c.PubKey.Compare(pk) == 0 {
+			app.changes[len(app.changes)-1], app.changes[i] = app.changes[i], app.changes[len(app.changes)-1]
+			app.changes = app.changes[:len(app.changes)-1]
+			break
+		}
+	}
+
+	// add a change
 	app.changes = append(app.changes, abci.ValidatorUpdate{PubKey: pk, Power: power})
 
 	return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
 }
 
 func unmarshalBytes(buf []byte, key string, checkNoMoreBytes bool) ([]byte, abci.ResponseDeliverTx) {
-	var bytes gogotypes.BytesValue
-	err := protoio.UnmarshalDelimited(buf, &bytes)
-	if err != nil {
-		return nil, abci.ResponseDeliverTx{Code: CodeTypeEncodingError, Log: fmt.Sprintf("Error reading %s: %v", key, err)}
-	}
-
-	if checkNoMoreBytes {
-		if len(buf) > len(bytes.Value) {
-			return nil, abci.ResponseDeliverTx{Code: CodeTypeEncodingError, Log: "Got bytes left over"}
+	if len(buf) < 8 {
+		return nil, abci.ResponseDeliverTx{
+			Code: CodeTypeEncodingError,
+			Log:  fmt.Sprintf("Not enough bytes %s: %d left, wanted %d", key, len(buf), 8),
 		}
 	}
 
-	return bytes.Value, abci.ResponseDeliverTx{}
+	// decode length
+	l, _ := decodeInt(buf[:8])
+
+	if len(buf) < 8+l {
+		return nil, abci.ResponseDeliverTx{
+			Code: CodeTypeEncodingError,
+			Log:  fmt.Sprintf("Not enough bytes %s: %d left, wanted %d", key, len(buf), 8+l),
+		}
+	}
+
+	// unmarshal bytes
+	bytes := make([]byte, l)
+	copy(bytes, buf[8:(l+8)])
+
+	if checkNoMoreBytes && len(buf) > 8+l {
+		return nil, abci.ResponseDeliverTx{Code: CodeTypeEncodingError, Log: "Got bytes left over"}
+	}
+
+	return bytes, abci.ResponseDeliverTx{}
+}
+
+// minimum length is 12 (nonce) + 1 (type byte) = 13
+func minTxLen() int {
+	return NonceLength + 1
+}
+
+func prefixedLen(b []byte) int {
+	return 8 + len(b)
+}
+
+// XXX: - possible overflow
+//			- panics if data is not uint64
+func decodeInt(b []byte) (int, error) {
+	if len(b) < 8 {
+		return -1, errors.New("not enough bytes")
+	}
+	return int(binary.BigEndian.Uint64(b)), nil
 }
