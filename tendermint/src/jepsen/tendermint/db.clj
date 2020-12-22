@@ -26,13 +26,25 @@
     (cu/install-archive! path (str base-dir "/" app))))
 
 (defn write-validator!
-  "Writes out the given validator structure to priv_validator.json."
+  "Writes out the given validator structure to priv_validator_key.json and
+  creates empty priv_validator_state.json."
   [validator]
   (c/su
    (c/cd base-dir
          (c/exec :echo (json/generate-string validator)
-                 :> "priv_validator_key.json")
+                 :> "config/priv_validator_key.json")
+         (c/exec :echo (json/generate-string {})
+                 :> "data/priv_validator_state.json")
          (info "Wrote priv_validator_key.json"))))
+
+(defn write-node-key!
+  "Writes out the given node key structure to node_key.json."
+  [node-key]
+  (c/su
+   (c/cd base-dir
+         (c/exec :echo (json/generate-string node-key)
+                 :> "config/node_key.json")
+         (info "Wrote node_key.json"))))
 
 (defn write-genesis!
   "Writes a genesis structure to a JSON file on disk."
@@ -40,7 +52,7 @@
   (c/su
    (c/cd base-dir
          (c/exec :echo (json/generate-string genesis)
-                 :> "genesis.json")
+                 :> "config/genesis.json")
          (info "Wrote genesis.json"))))
 
 (defn write-config!
@@ -49,15 +61,24 @@
   (c/su
    (c/cd base-dir
          (c/exec :echo (slurp (io/resource "config.toml"))
-                 :> "config.toml"))))
+                 :> "config/config.toml"))))
 
-(defn seeds
-  "Constructs a --seeds command line for a test, so a tendermint node knows
+(defn node-id
+  "Extracts a node ID from node-keys field of test for a given node"
+  [test node]
+  (-> @(:validator-config test)
+      (:node-keys test)
+      (get node)
+      (:id))
+  )
+
+(defn persistent-peers
+  "Constructs a --persistent_peers command line for a test, so a tendermint node knows
   what other nodes to talk to."
   [test node]
   (->> (:nodes test)
        (remove #{node})
-       (map (fn [node] (str node ":26656")))
+       (map (fn [node] (str (node-id test node) "@" node ":26656")))
        (str/join ",")))
 
 (def socket-file (str base-dir "/merkleeyes.sock"))
@@ -83,7 +104,7 @@
           :--home base-dir
           :node
           :--proxy_app socket
-          :--p2p.seeds (seeds test node))))
+          :--p2p.persistent_peers (persistent-peers test node))))
   :started)
 
 (defn start-merkleeyes!
@@ -95,10 +116,9 @@
           {:logfile merkleeyes-logfile
            :pidfile merkleeyes-pidfile
            :chdir   base-dir}
-          "./merkleeyes"
-          :start
-          :--dbName   "jepsen"
-          :--address  socket)))
+          "./merkleeyes/merkleeyes"
+          :-laddr   socket
+          :-dbdir   "jepsen")))
   :started)
 
 (defn stop-tendermint! [test node]
@@ -123,10 +143,9 @@
 (def node-files
   "Files required for a validator's state."
   (map (partial str base-dir "/")
-       ["data"
-        "jepsen"
-        "priv_validator.json"
-        "priv_validator.json.bak"]))
+       ["config"
+        "data"
+        "jepsen"]))
 
 (defn reset-node!
   "Wipe data files and identity but preserve binaries."
@@ -148,6 +167,7 @@
        (install-component! "tendermint"  opts)
        (install-component! "merkleeyes"  opts)
 
+       (c/exec :mkdir (str base-dir "/config"))
        (write-config!)
 
         ; OK we're ready to compute the initial validator config.
@@ -165,7 +185,8 @@
        (let [vc @(:validator-config opts)]
          (write-genesis! (tv/genesis vc))
          (write-validator! (get (:validators vc)
-                                (get-in vc [:nodes node]))))
+                                (get-in vc [:nodes node])))
+         (write-node-key! (get (:node-keys vc) node)))
 
        (start-merkleeyes! test node)
        (start-tendermint! test node)
@@ -184,5 +205,7 @@
     (log-files [_ test node]
       [tendermint-logfile
        merkleeyes-logfile
-       (str base-dir "/priv_validator.json")
-       (str base-dir "/genesis.json")])))
+       (str base-dir "/config/priv_validator_key.json")
+       (str base-dir "/config/node_key.json")
+       (str base-dir "/data/priv_validator_key.json")
+       (str base-dir "/config/genesis.json")])))
