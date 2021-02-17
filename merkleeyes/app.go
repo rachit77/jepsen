@@ -17,7 +17,7 @@ import (
 
 const (
 	// Version is the semantic version of this package.
-	Version = "0.1.0"
+	Version = "0.1.7"
 
 	// Transaction type bytes
 	TxTypeSet           byte = 0x01
@@ -267,7 +267,7 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 
 		_ = tree.Set(storeKey(key), value)
 
-		app.logger.Info("SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
+		app.logger.Info("SET", "key", fmt.Sprintf("%X", key), "value", fmt.Sprintf("%X", value))
 		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
 
 	case TxTypeRm:
@@ -278,13 +278,14 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 
 		_, removed := tree.Remove(storeKey(key))
 		if !removed {
+			app.logger.Info("RM -> FAILED", "key", fmt.Sprintf("%X", key))
 			return abci.ResponseDeliverTx{
 				Code: CodeTypeErrBaseUnknownAddress,
 				Log:  fmt.Sprintf("Failed to remove %X", key),
 			}
 		}
 
-		app.logger.Info("RM", fmt.Sprintf("%X", key))
+		app.logger.Info("RM", "key", fmt.Sprintf("%X", key))
 		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
 
 	case TxTypeGet:
@@ -295,12 +296,13 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 
 		_, value := tree.Get(storeKey(key))
 		if value == nil {
+			app.logger.Info("GET -> NOT FOUND", "key", fmt.Sprintf("%X", key))
 			return abci.ResponseDeliverTx{
 				Code: CodeTypeErrBaseUnknownAddress,
 				Log:  fmt.Sprintf("Cannot find key: %X", key)}
 		}
 
-		app.logger.Info("GET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", value))
+		app.logger.Info("GET", "key", fmt.Sprintf("%X", key), "value", fmt.Sprintf("%X", value))
 		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: value}
 
 	case TxTypeCompareAndSet:
@@ -321,6 +323,7 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 
 		_, value := tree.Get(storeKey(key))
 		if value == nil {
+			app.logger.Info("CAS -> NOT FOUND", "key", fmt.Sprintf("%X", key))
 			return abci.ResponseDeliverTx{
 				Code: CodeTypeErrBaseUnknownAddress,
 				Log:  fmt.Sprintf("Cannot find key: %X", key),
@@ -328,6 +331,11 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 		}
 
 		if !bytes.Equal(value, compareValue) {
+			app.logger.Info("CAS-REJECTED",
+				"key", fmt.Sprintf("%X", key),
+				"compare", fmt.Sprintf("%X", compareValue),
+				"actual-value", fmt.Sprintf("%X", value),
+			)
 			return abci.ResponseDeliverTx{
 				Code: CodeTypeErrUnauthorized,
 				Log:  fmt.Sprintf("Value was %X, not %X", value, compareValue),
@@ -336,7 +344,11 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 
 		_ = tree.Set(storeKey(key), setValue)
 
-		app.logger.Info("CAS-SET", fmt.Sprintf("%X", key), fmt.Sprintf("%X", compareValue), fmt.Sprintf("%X", setValue))
+		app.logger.Info("CAS-SET",
+			"key", fmt.Sprintf("%X", key),
+			"compare", fmt.Sprintf("%X", compareValue),
+			"set-value", fmt.Sprintf("%X", setValue),
+		)
 		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
 
 	case TxTypeValSetChange:
@@ -361,6 +373,11 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 			}
 		}
 
+		app.logger.Info("VALSET-CHANGE",
+			"pubkey", fmt.Sprintf("%X", pubKey),
+			"power", power,
+		)
+
 		return app.updateValidator(pubKey, int64(power))
 
 	case TxTypeValSetRead:
@@ -371,7 +388,10 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 				Log:  fmt.Sprintf("Marshaling error: %v", err),
 			}
 		}
-		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: bz, Log: string(bz)}
+
+		app.logger.Info("VALSET-READ", "version", app.state.Validators.Version)
+
+		return abci.ResponseDeliverTx{Code: abci.CodeTypeOK, Data: bz}
 
 	case TxTypeValSetCAS:
 		if len(tx) < 8 {
@@ -413,6 +433,11 @@ func (app *App) doTx(tx []byte) abci.ResponseDeliverTx {
 			}
 		}
 
+		app.logger.Info("VALSET-CAS",
+			"pubkey", fmt.Sprintf("%X", pubKey),
+			"power", power,
+		)
+
 		return app.updateValidator(pubKey, int64(power))
 
 	default:
@@ -439,9 +464,7 @@ func (app *App) updateValidator(pubKey []byte, power int64) abci.ResponseDeliver
 		app.state.Validators.Set(v)
 	}
 
-	var pubKeyEd ed25519.PubKey
-	copy(pubKeyEd[:], pubKey)
-	pk, err := cryptoenc.PubKeyToProto(pubKeyEd)
+	pk, err := cryptoenc.PubKeyToProto(v.PubKey)
 	if err != nil {
 		panic(err)
 	}

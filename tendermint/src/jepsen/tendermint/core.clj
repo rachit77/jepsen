@@ -180,8 +180,8 @@
            nemesis/complete-grudge))))
 
 (defrecord CrashTruncateNemesis [test file faulty-nodes]
-   client/Client
-    ; (setup! [this test _] this)
+   nemesis/Nemesis
+    (setup! [this test] this)
 
     (invoke! [this test op]
              (info :nemesis-got op)
@@ -222,8 +222,8 @@
   (nemesis/node-start-stopper identity td/stop! td/start!))
 
 (defrecord ChangingValidatorsNemesis []
-  client/Client
-  ; (setup! [this test _] this)
+  nemesis/Nemesis
+  (setup! [this test] this)
 
   (invoke! [this test op]
            (if (= :stop (:f op))
@@ -239,21 +239,21 @@
                      (tc/with-any-node test
                        tc/validator-set-cas!
                        (:version t)
-                       (:data (:pub_key (:validator t)))
+                       (:value (:pub_key (:validator t)))
                        (:votes (:validator t)))
 
                      :remove
                      (tc/with-any-node test
                        tc/validator-set-cas!
                        (:version t)
-                       (:data (:pub_key t))
+                       (:value (:pub_key t))
                        0)
 
                      :alter-votes
                      (tc/with-any-node test
                        tc/validator-set-cas!
                        (:version t)
-                       (:data (:pub_key t))
+                       (:value (:pub_key t))
                        (:votes t))
 
                      :create
@@ -266,7 +266,7 @@
                      (c/on-nodes test (list (:node t))
                                  (fn destroy [test node]
                                    (td/stop! test node)
-                                   (td/reset-node! test node))))
+                                   (td/reset-validator! test node))))
 
                    ; After we've executed an operation, we need to update our test
                    ; state to reflect the new state of things.
@@ -274,7 +274,7 @@
 
            (assoc op :value :done))
 
-  (teardown! [this test])
+  (teardown! [this test] this)
   )
 
 (defn changing-validators-nemesis
@@ -289,7 +289,7 @@
   [test]
   (case (:nemesis test)
     :changing-validators {:nemesis   (changing-validators-nemesis)
-                          :generator (gen/stagger 10 (tv/generator))}
+                          :generator (gen/stagger 1 (tv/generator))}
 
     :peekaboo-dup-validators {:nemesis (nemesis/partitioner
                                         (peekaboo-dup-validators-grudge test))
@@ -320,7 +320,7 @@
                                        {:type :info, :f :stop}])}
 
     :clocks     {:nemesis   (nt/clock-nemesis)
-                 :generator (gen/stagger 5 (nt/clock-gen))}
+                 :generator (gen/stagger 1/2 (nt/clock-gen))}
 
     :crash      {:nemesis (crash-nemesis)
                  :generator (seq [(gen/sleep 15)
@@ -330,24 +330,14 @@
     :truncate-merkleeyes {:nemesis (crash-truncate-nemesis
                                     test 1/3 "/jepsen/jepsen.db/000001.log")
                           :generator (->> {:type :info, :f :crash}
-                                          (gen/delay 10))}
+                                          (gen/delay 1))}
 
     :truncate-tendermint {:nemesis (crash-truncate-nemesis
                                     test 1/3 "/data/cs.wal/wal")
                           :generator (->> {:type :info, :f :crash}
-                                          (gen/delay 10))}
+                                          (gen/delay 1))}
 
     :none       {:nemesis   nemesis/noop}))
-
-(defn deref-gen
-  "Sometimes you need to build a generator not *now*, but *later*; e.g. because
-  it depends on state that won't be available until the generator is actually
-  invoked. Wrap a derefable returning a generator in this, and it'll be deref'ed
-  only when asked for ops."
-  [dgen]
-  (reify gen/Generator
-    (op [this test process]
-      (gen/op @dgen test process))))
 
 (defn workload
   "Given a test map, computes
@@ -359,44 +349,41 @@
   (let [n (count (:nodes test))]
     (case (:workload test)
       :cas-register {:client    (CasRegisterClient. nil)
+                     :concurrency (* 2 n)
                      :generator (independent/concurrent-generator
-                                 n
+                                 (* 2 n)
                                  (range)
                                  (fn [k]
                                    (->> (gen/mix [w cas])
                                         (gen/reserve n r)
-                                        (gen/stagger 1)
+                                        (gen/stagger 1/10)
                                         (gen/limit 120))))
                      :final-generator nil
                      :checker {:linear (independent/checker
                                          (checker/linearizable {:model (model/cas-register)
                                                                 :algorithm :linear}))}}
       :set
-      (let [keys (atom [])]
+      (let [max-key (atom 0)]
         {:client (SetClient. nil)
+         :concurrency (* 2 n)
          :generator (independent/concurrent-generator
-                     n
+                     (* 2 n)
                      (range)
                      (fn [k]
-                       (swap! keys conj k)
+                       (swap! max-key max k)
                        (gen/phases
-                        (gen/once {:type :invoke, :f :init})
+                        (gen/once {:f :init})
                         (->> (range)
                              (map (fn [x]
-                                    {:type :invoke
-                                     :f    :add
+                                    {:f    :add
                                      :value x}))
-                             ; gen.seq
                              (gen/stagger 1/2)))))
-         :final-generator (deref-gen
-                           (delay
-                            (locking keys
-                              (independent/concurrent-generator
-                               n
-                               @keys
-                               (fn [k]
-                                 (gen/each-thread (gen/once {:type :invoke
-                                                             :f :read})))))))
+         :final-generator (delay
+                            (independent/concurrent-generator
+                              (* 2 n)
+                              (range @max-key)
+                              (fn [k]
+                                (gen/once {:f :read}))))
          :checker {:set (independent/checker (checker/set))}}))))
 
 (defn test
@@ -421,6 +408,7 @@
         test    (merge test
                        {:db         db
                         :client     (:client workload)
+                        :concurrency     (:concurrency workload)
                         :generator  (gen/phases
                                      (->> (:generator workload)
                                           (gen/nemesis (:generator nemesis))

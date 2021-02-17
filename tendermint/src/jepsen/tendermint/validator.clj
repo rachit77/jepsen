@@ -115,7 +115,8 @@
   "Create an instance of a validator on a node"
   (t/HMap :mandatory {:type       (t/Val :create)
                       :node       Node
-                      :validator  Validator}
+                      :validator  Validator
+                      :node-key   NodeKey}
           :complete? true))
 
 (t/defalias DestroyTransition
@@ -709,18 +710,19 @@
    (case (:type transition)
       ; Create a new validator on a node
      :create (let [n (:node transition)
-                   v (:validator transition)]
+                   v (:validator transition)
+                   k (:node-key transition)]
                (assert (not (get-in config [:nodes n])))
-               (assoc config :nodes (assoc (:nodes config) n (:pub_key v))))
+               (assoc config :nodes (assoc (:nodes config) n (:pub_key v)))
+               (assoc config :node-keys (assoc (:node-keys config) n k)))
 
       ; Destroy a validator on a node
-     :destroy (assoc config :nodes (dissoc (:nodes config)
-                                           (:node transition)))
+      :destroy (let [n (:node transition)]
+                 (assoc config :nodes (dissoc (:nodes config) n))
+                 (assoc config :node-keys (dissoc (:node-keys config) n)))
 
 
       ; Add a validator to the validator set
-
-
      :add (let [v (:validator transition)]
             (assert (not (get-in config [:validators (:pub_key v)])))
             (-> config
@@ -780,11 +782,13 @@
   (or (condp <= (rand)
         ; Create a new instance of a validator on a node.
         4/5 (let [v (rand-validator config)
-                  n (rand-free-node config)]
+                  n (rand-free-node config)
+                  k (gen-node-key)]
               (when (and v n)
                 {:type      :create
                  :node      n
-                 :validator v}))
+                 :validator v
+                 :node-key k}))
 
         ;; Nuke a node
         3/5 (when-let [node (rand-taken-node config)]
@@ -941,37 +945,45 @@
 
 (t/tc-ignore
 
- (defn refresh-config!
-   "Attempts to update the test's config with new information from the cluster.
-  Returns our estimate of the current config. Not threadsafe."
-   [test]
-  ; TODO: make this threadsafe
-   (or (reduce (fn [_ node]
-                 (try
-                   (when-let [c (current-config test node)]
-                     (reset! (:validator-config test) c)
-                     (reduced c))
-                   (catch java.io.IOException e
-                    ; (info e "unable to fetch current validator set config")
-                     nil)))
-               nil
-               (shuffle (:nodes test)))
-       @(:validator-config test)))
+  (defn refresh-config!
+    "Attempts to update the test's config with new information from the cluster.
+    Returns our estimate of the current config. Not threadsafe."
+    [test]
+    ; TODO: make this threadsafe
+    (or (reduce (fn [_ node]
+                  (try
+                    (when-let [c (current-config test node)]
+                      (reset! (:validator-config test) c)
+                      (reduced c))
+                    (catch java.io.IOException e
+                      ; (info e "unable to fetch current validator set config")
+                      nil)))
+                nil
+                (shuffle (:nodes test)))
+        @(:validator-config test)))
 
- (defn generator
-   "A generator of legal state transitions on the current validator state."
-   []
-   (reify gen/Generator
-     (op [this test process]
-       (try
-         (info "refreshing config")
-         (let [config (refresh-config! test)]
-           (info :config-refreshed)
-           (info (with-out-str (pprint config)))
-           (info (with-out-str (pprint (compact-config config))))
-           {:type  :info
-            :f     :transition
-            :value (rand-legal-transition test config)})
-         (catch Exception e
-           (warn e "error generating transition")
-           (throw e)))))))
+  (defrecord Generator []
+    gen/Generator
+    (op [this test ctx]
+      (try
+       (info "refreshing config")
+       (let [config (refresh-config! test)]
+         (info :config-refreshed)
+         (info (with-out-str (pprint config)))
+         (info (with-out-str (pprint (compact-config config))))
+         (let [op {:type  :info
+                   :f     :transition
+                   :value (rand-legal-transition test config)}]
+           [(gen/fill-in-op op ctx) this]))
+       (catch Exception e
+         (warn e "error generating transition")
+         (throw e))))
+    (update [this test ctx event]
+      this))
+
+  (defn generator
+    "A generator of legal state transitions on the current validator state."
+    []
+    (jepsen.tendermint.validator.Generator.))
+
+)
