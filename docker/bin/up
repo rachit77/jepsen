@@ -35,7 +35,7 @@ INIT_ONLY=0
 DEV=""
 COMPOSE=${COMPOSE:-""}
 RUN_AS_DAEMON=0
-POSITIONAL=()
+POSITIONAL=("")
 
 while [[ $# -gt 0 ]]
 do
